@@ -148,9 +148,8 @@ class BatchKinematics:
                 R_FM, p_FM = _joint_map(how, Q, ps)
                 X_FM = np.zeros((N, 4, 4))
                 X_FM[:, :3, :3], X_FM[:, :3, 3], X_FM[:, 3, 3] = R_FM, p_FM, 1.0
-                N_ = len(X_FM)
-                X_rel = _compose(_compose(np.broadcast_to(data[0], (N_, 4, 4)), X_FM),
-                                 np.broadcast_to(data[1], (N_, 4, 4)))
+                X_rel = _compose(_compose(np.broadcast_to(data[0], (N, 4, 4)), X_FM),
+                                 np.broadcast_to(data[1], (N, 4, 4)))
             X[:, a] = X_rel if parent == 0 else _compose(X[:, parent], X_rel)
         return X
 

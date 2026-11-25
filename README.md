@@ -19,19 +19,22 @@ bounds and the same resolution contract.
 ## Install
 
 ```bash
-pip install continuous-collision
+pip install continuous-collision      # once published; from a checkout: pip install .
 ```
 
-The distribution may be published as `ccd-drake` if `continuous-collision` is
-taken on PyPI; the import name is `continuous_collision` either way.
-The only dependency is `drake` from PyPI (plus `numpy`, which it brings).
+The name `continuous-collision` was free on PyPI on 2026-11-25; the import name
+is `continuous_collision`.
+The only dependencies are `drake>=1.51.1` and `numpy` from PyPI.
 There is no compiled code.
+Python 3.10 and 3.11 are served by drake 1.51.1, the last Drake wheel built for
+them; newer Drake wheels need Python 3.12 or later.
 
 ## Example
 
-<!-- Scene and expected output verified on 2026-11-25 against the fork's
-pydrake.planning.continuous_collision (master-ccd, b6b672d232) with the import
-line swapped; re-verify against this package. -->
+<!-- Scene and output verified on 2026-11-25 with this package on drake 1.51.1
+and with the fork's pydrake.planning.continuous_collision (import line swapped):
+same verdicts, same witness time 0.449185848236084 s and configuration, distance
+0.009998621448568765 m (fork: ...8750, a 1.5e-17 m difference), 54 nodes in both. -->
 
 ```python
 import numpy as np
@@ -77,7 +80,7 @@ closest points in the world frame.
 |---|---|---|
 | `kCertifiedFree` | Proof: every unfiltered pair keeps signed distance > margin over the entire continuous time domain. | `None` |
 | `kViolationFound` | An exactly-on-trajectory configuration violates the margin. | The earliest violation found, with the closest points. |
-| `kInconclusive` | Some pair's clearance comes within `Options.distance_resolution` (plus the oracle tolerance) of the margin, so refining further cannot decide it: the trajectory grazes the margin. | The inconclusive witness, an on-trajectory configuration; closest points `None`. |
+| `kInconclusive` | Some pair's clearance comes within `Options.distance_resolution` (plus the oracle tolerance) of the margin, so refining further cannot decide it: the trajectory grazes the margin. | The inconclusive witness, an on-trajectory configuration, with the closest points. |
 
 A trajectory that clears the margin by more than
 $r + \sigma_p + 2\tau_p + \varepsilon$ everywhere is certified, and one that
@@ -149,8 +152,12 @@ The checker was written for Drake as
 `certified-ccd` of `github.com/wernerpe/drake`).
 The Drake wheels on PyPI ship no C++ headers, so that code cannot be added to a
 pip-installed Drake. Using it today means a source build of the fork.
-This package runs the same algorithm in Python on top of stock pydrake distance
-queries.
+This package runs the same algorithm in Python on top of stock pydrake: Drake's
+own signed-distance queries for general shape pairs, and exact closed forms for
+half-space, sphere-sphere, sphere-box and box-box pairs.
+On the 436 curves of the brick corpus it returns the fork's verdict and witness
+on every curve, at 1.1 times the fork's single-thread wall time (median);
+[docs/benchmarks.md](docs/benchmarks.md) has the numbers.
 If the PR lands, switch by changing one import:
 
 ```python

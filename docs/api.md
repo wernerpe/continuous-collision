@@ -38,8 +38,11 @@ Where the plan fails, or where it could not be decided.
 | `nearest_a_W` | `np.ndarray`, shape `(3,)`, or `None` | Closest point on `geometry_a` in the world frame at `q`. |
 | `nearest_b_W` | `np.ndarray`, shape `(3,)`, or `None` | Closest point on `geometry_b` in the world frame at `q`. |
 
-The closest points are present for violations, so that planners can push the
-trajectory out of collision. They are `None` for an inconclusive witness.
+The closest points are present on every finding, violation or inconclusive, so
+that planners can push the trajectory out of collision. (The fork's header
+documents them for violations; its code fills them on both, and so does this
+package.) They are measured by Drake's `ComputeSignedDistancePairClosestPoints`
+at `q`, or in closed form for a pair with a half space.
 
 For a violation, `distance` is below the margin and is the earliest violation
 the search recorded.
@@ -83,6 +86,10 @@ coordinates whose junction continuity is checked modulo $2\pi$ (the
 **`parallelism`** (`pydrake.common.Parallelism`, default
 `Parallelism.Max()`). The parallelism a check may use. The verdict and the
 reported witness do not depend on it.
+This package accepts it for API parity and evaluates serially: stock pydrake
+1.51.1 has no batched per-pair distance query, and its distance queries hold
+the interpreter lock, so threads cannot speed them up. The search batches
+nodes into rounds instead (see [relation-to-drake.md](relation-to-drake.md)).
 
 ## `Result`
 
@@ -134,7 +141,10 @@ Resolutions below what double precision can represent along a segment are
 capped by a floating-point backstop.
 
 **Pairs.** The checked pairs are the proximity pairs left unfiltered by the
-model's collision filters at construction. Filter changes applied to a
+model's collision filters at construction: exactly SceneGraph's collision
+candidates, geometry by geometry, including environment-environment pairs that
+the filters leave live (MultibodyPlant filters pairs within a welded subgraph,
+so two bodies welded to the world never form one). Filter changes applied to a
 `Context` afterwards are not observed, so a checker keeps certifying the pair
 set it was constructed with.
 
@@ -178,8 +188,8 @@ Raises:
 - if `Options.continuous_revolute_indices` names a coordinate outside the
   plant's;
 - if the trajectory moves a coordinate of an unsupported joint type
-  (quaternion floating, ball), or moves a `HalfSpace` across a rotational
-  coordinate.
+  (quaternion floating, roll-pitch-yaw floating, ball, universal), or moves a
+  `HalfSpace` across a rotational coordinate.
 
 The supported moving joint types are revolute, prismatic, planar and screw.
 Any other joint type is accepted only while the trajectory holds its
@@ -222,7 +232,10 @@ So the verdict and the reported witness are a function of the trajectory and
 the options alone.
 `Result.num_nodes` is too on a run that certifies.
 Where a violation prunes the search, the set of nodes skipped depends on
-search order, so `num_nodes` can vary.
+search order, so `num_nodes` can vary (in this package it does not vary from
+run to run, but it can differ from the fork's).
+None of this depends on how many nodes this package decides in one round: each
+node's arithmetic is computed the same way whatever shares its round.
 One exception: on a degenerate segment whose start and end times coincide,
 every node maps to the same time, so the reported configuration (not its time)
 may differ.
@@ -232,5 +245,7 @@ may differ.
 The PR header states: the `Check*` methods are const, own no mutable state
 outside per-call scratch, and may be called concurrently on one instance from
 arbitrary threads; construction and destruction are not thread-safe.
-This package targets the same rule, but it is pure Python: calls from several
-Python threads share the interpreter lock.
+This package follows the same rule: everything the checker learns about the
+model is computed at construction and never mutated, and each call leases its
+own Drake context. It is pure Python, so calls from several Python threads
+share the interpreter lock.

@@ -2,13 +2,14 @@
 
 Design note: the fork walks one node at a time on a shared LIFO stack across C++ threads. In
 Python the per-node cost would be interpreter overhead, so the same search runs in rounds: a
-round takes up to CHUNK pending nodes of one segment, splits them all at once, poses them all
-with one batched forward-kinematics call, decides every (node, active pair) entry with array
-arithmetic, and sends only the entries no closed form can decide to Drake's narrowphase.
-Children are pushed back left of everything still pending, so the sweep runs left to right in
-time and the earliest-violation bound prunes as in the fork. Every node's decisions depend
-only on its own control points and inherited active set, so the verdict and the witness are
-those of the fork's serial search; num_nodes matches whenever nothing is pruned.
+round takes up to CHUNK pending nodes (segments of one Bezier degree share rounds), splits
+them all at once, poses them with one batched forward-kinematics call, decides every (node,
+active pair) entry with array arithmetic, and sends only the entries no closed form can decide
+to Drake's narrowphase. Children are pushed back left of everything still pending, so the
+sweep runs left to right in time and the earliest-violation bound prunes as in the fork. Every
+node's decisions depend only on its own control points and inherited active set, and its
+arithmetic does not depend on what shares its round, so the verdict and the witness are those
+of the fork's serial search; num_nodes matches whenever nothing is pruned.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from ._numerics import NUMERICAL_SLACK, is_certified, is_definite_violation
+from ._numerics import is_certified, is_definite_violation
 from .bezier_path import PiecewiseBezierPath, split_at_half
 from .distance_oracle import DistanceOracle, Route, box_box_exact
 from .kinematics import BatchKinematics
@@ -30,6 +31,8 @@ CHUNK = 2048
 
 @dataclass
 class Witness:
+    """An on-trajectory configuration, its pair, and the distance the decision used."""
+
     time: float
     q: np.ndarray
     pair: int
@@ -291,5 +294,3 @@ class Certifier:
         return _Chunk(np.repeat(ch.seg[parents], 2), s_lo, s_hi, cps, child[order],
                       np.concatenate((s_pairs, s_pairs))[order])
 
-
-__all__ = ["Certifier", "Witness", "NUMERICAL_SLACK"]

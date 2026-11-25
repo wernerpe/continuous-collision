@@ -3,9 +3,11 @@
 Design note: stock pydrake exposes no batched per-geometry-pair distance query, and every
 query through a QueryObject first pays a full pose update of the scene. So the oracle splits
 pairs by route, decided once at construction: pairs with an exact closed form -- a half space
-against any convex shape (the fork's analytic fallback) and two spheres -- are evaluated for a
-whole round of configurations at once in numpy from batched forward kinematics, and only the
-remaining pairs go through Drake's narrowphase, one configuration at a time. The pair set is
+against any convex shape (the fork's analytic fallback), two spheres, a sphere and a box, two
+boxes -- are evaluated for a whole round of configurations at once in numpy from batched
+forward kinematics, and only the remaining pairs go through Drake's narrowphase, one
+configuration at a time. The box-box form also sidesteps Drake's polytope distance, which can
+over-report by far more than its documented accuracy on rare poses. The pair set is
 SceneGraph's own unfiltered candidate set, snapshotted at construction, exactly as in the fork.
 """
 
@@ -124,10 +126,10 @@ class DistanceOracle:
                              else native_tolerance(ShapeClass(a), ShapeClass(b))
                              for r, a, b in zip(route, class_a, class_b)]).reshape(P)
 
-        # Geometry slots: every geometry in some pair, with its body, pose in the body, class,
-        # and bounding sphere (radius -1 for a half space, which has none).
+        # Geometry slots: every geometry in some pair, with its anchor (BatchKinematics), pose in
+        # the anchor frame, class, and bounding sphere (radius -1 for a half space: none).
         slot_of = {}
-        self.slot_geometry, slot_body, slot_R, slot_p, slot_center, slot_radius, slot_class = \
+        self.slot_geometry, slot_anchor, slot_R, slot_p, slot_center, slot_radius, slot_class = \
             [], [], [], [], [], [], []
         self.slot_extent, self.slot_vertices = [], []
 
@@ -141,7 +143,7 @@ class DistanceOracle:
             self.slot_geometry.append(g)
             # Everything is stored in the body's anchor frame (see BatchKinematics).
             R_AB, p_AB = kinematics.R_AB[body], kinematics.p_AB[body]
-            slot_body.append(kinematics.anchor_of_body[body])
+            slot_anchor.append(kinematics.anchor_of_body[body])
             slot_R.append(R_AB @ X_BG.rotation().matrix())
             slot_p.append(R_AB @ np.asarray(X_BG.translation(), float) + p_AB)
             slot_class.append(int(klass))
@@ -159,7 +161,7 @@ class DistanceOracle:
         self.slot_a = np.array([slot(g, b) for g, b in zip(self.geometry_a, body_a)], dtype=int).reshape(P)
         self.slot_b = np.array([slot(g, b) for g, b in zip(self.geometry_b, body_b)], dtype=int).reshape(P)
         G = len(self.slot_geometry)
-        self.slot_body = np.array(slot_body, dtype=int).reshape(G)
+        self.slot_anchor = np.array(slot_anchor, dtype=int).reshape(G)
         self.slot_R = np.array(slot_R).reshape(G, 3, 3)
         self.slot_p = np.array(slot_p).reshape(G, 3)
         self.slot_center = np.array(slot_center).reshape(G, 3)
@@ -167,16 +169,16 @@ class DistanceOracle:
         self.slot_class = np.array(slot_class, dtype=int).reshape(G)
         self.slot_extent = np.array(self.slot_extent).reshape(G, 3)
         # Bounding-sphere centers grouped by anchor for `centers`; the world anchor's are fixed.
-        self._fixed = np.flatnonzero(self.slot_body == 0)
+        self._fixed = np.flatnonzero(self.slot_anchor == 0)
         # The others' centers in homogeneous anchor coordinates, padded to a common width, and
         # each moving slot's position in the flattened (anchor, column) product.
-        self._moving = np.flatnonzero(self.slot_body != 0)
-        self._anchors = np.unique(self.slot_body[self._moving])
-        width = max([int((self.slot_body == a).sum()) for a in self._anchors], default=0)
+        self._moving = np.flatnonzero(self.slot_anchor != 0)
+        self._anchors = np.unique(self.slot_anchor[self._moving])
+        width = max([int((self.slot_anchor == a).sum()) for a in self._anchors], default=0)
         self._local = np.zeros((len(self._anchors), 4, width))
         self._column = np.zeros(len(self._moving), dtype=int)
         for i, a in enumerate(self._anchors):
-            members = np.flatnonzero(self.slot_body[self._moving] == a)
+            members = np.flatnonzero(self.slot_anchor[self._moving] == a)
             self._local[i, :3, :len(members)] = self.slot_center[self._moving[members]].T
             self._local[i, 3, :len(members)] = 1.0
             self._column[members] = i * width + np.arange(len(members))
@@ -227,10 +229,10 @@ class DistanceOracle:
 
     # ------------------------------------------------------------------ batched
 
-    def geometry_poses(self, R_WB, p_WB, nodes, slots):
+    def geometry_poses(self, R_WA, p_WA, nodes, slots):
         """(R_WG, p_WG) for geometry `slots[k]` at node `nodes[k]`, from anchor poses."""
-        R = R_WB[nodes, self.slot_body[slots]]
-        p = p_WB[nodes, self.slot_body[slots]]
+        R = R_WA[nodes, self.slot_anchor[slots]]
+        p = p_WA[nodes, self.slot_anchor[slots]]
         return R @ self.slot_R[slots], np.einsum("kij,kj->ki", R, self.slot_p[slots]) + p
 
     def centers(self, X: np.ndarray) -> np.ndarray:
@@ -238,20 +240,20 @@ class DistanceOracle:
         homogeneous poses X (BatchKinematics.anchor_transforms). A stacked product, computed
         slice by slice, so a node's centers do not depend on its round."""
         N = X.shape[0]
-        C = np.empty((N, len(self.slot_body), 3))
+        C = np.empty((N, len(self.slot_anchor), 3))
         C[:, self._fixed] = self.slot_center[self._fixed]
         if len(self._anchors):
             W = np.matmul(np.ascontiguousarray(X[:, self._anchors, :3]), self._local)  # (N, A', 3, w)
             C[:, self._moving] = np.swapaxes(W, 2, 3).reshape(N, -1, 3)[:, self._column]
         return C
 
-    def halfspace_distance(self, R_WB, p_WB, nodes, pairs, want_points=False):
+    def halfspace_distance(self, R_WA, p_WA, nodes, pairs, want_points=False):
         """Exact signed distance of half-space pairs at the batched poses (see `_halfspace`)."""
         a_half = self.route[pairs] == Route.HALFSPACE_A
         h_slot = np.where(a_half, self.slot_a[pairs], self.slot_b[pairs])
         c_slot = np.where(a_half, self.slot_b[pairs], self.slot_a[pairs])
-        R_H, p_H = self.geometry_poses(R_WB, p_WB, nodes, h_slot)
-        R_C, c = self.geometry_poses(R_WB, p_WB, nodes, c_slot)
+        R_H, p_H = self.geometry_poses(R_WA, p_WA, nodes, h_slot)
+        R_C, c = self.geometry_poses(R_WA, p_WA, nodes, c_slot)
         return self._halfspace(a_half, c_slot, R_H, p_H, R_C, c, want_points)
 
     def _halfspace(self, a_half, c_slot, R_H, p_H, R_C, c, want_points):
@@ -267,7 +269,7 @@ class DistanceOracle:
         pb = np.where(a_half[:, None], x, plane)
         return phi, pa, pb
 
-    def sphere_box_distance(self, R_WB, C, nodes, pairs) -> np.ndarray:
+    def sphere_box_distance(self, R_WA, C, nodes, pairs) -> np.ndarray:
         """Exact signed distance of sphere-box pairs: with p the sphere center in the box frame
         and h the half sizes, |max(|p| - h, 0)| - r outside the box, and -(min(h - |p|)) - r
         inside, which is the penetration depth of the minimal separating translation."""
@@ -276,7 +278,7 @@ class DistanceOracle:
         b_slot = np.where(a_sphere, self.slot_b[pairs], self.slot_a[pairs])
         # Both bounding spheres are centered on the geometry origins, so C holds the centers.
         v = C[nodes, s_slot] - C[nodes, b_slot]
-        v = np.einsum("kji,kj->ki", R_WB[nodes, self.slot_body[b_slot]], v)
+        v = np.einsum("kji,kj->ki", R_WA[nodes, self.slot_anchor[b_slot]], v)
         local = np.abs(np.einsum("kji,kj->ki", self.slot_R[b_slot], v))
         h = self.slot_extent[b_slot]
         outside = np.maximum(local - h, 0.0)
@@ -284,27 +286,27 @@ class DistanceOracle:
         inside = -np.min(h - local, axis=1)
         return np.where((local > h).any(axis=1), out, inside) - self.slot_extent[s_slot, 0]
 
-    def _box_frames(self, R_WB, C, nodes, pairs):
+    def _box_frames(self, R_WA, C, nodes, pairs):
         """B's rotation and center in A's frame, and both half sizes, for box-box entries."""
         sa, sb = self.slot_a[pairs], self.slot_b[pairs]
-        R_A = R_WB[nodes, self.slot_body[sa]] @ self.slot_R[sa]
-        R_B = R_WB[nodes, self.slot_body[sb]] @ self.slot_R[sb]
+        R_A = R_WA[nodes, self.slot_anchor[sa]] @ self.slot_R[sa]
+        R_B = R_WA[nodes, self.slot_anchor[sb]] @ self.slot_R[sb]
         R = np.swapaxes(R_A, 1, 2) @ R_B  # B's axes in A's frame, as columns.
         t = np.einsum("kji,kj->ki", R_A, C[nodes, sb] - C[nodes, sa])  # Bounding centers = box centers.
         return R, t, self.slot_extent[sa], self.slot_extent[sb]
 
-    def box_box_lower_bound(self, R_WB, C, nodes, pairs) -> np.ndarray:
+    def box_box_lower_bound(self, R_WA, C, nodes, pairs) -> np.ndarray:
         """The largest gap over the 15 separating axes: a lower bound on the signed distance
         of two boxes on both branches, and exactly it when they interpenetrate."""
-        return _separating_axis_gap(*self._box_frames(R_WB, C, nodes, pairs))
+        return _separating_axis_gap(*self._box_frames(R_WA, C, nodes, pairs))
 
-    def box_box_bounds(self, R_WB, C, nodes, pairs):
+    def box_box_bounds(self, R_WA, C, nodes, pairs):
         """(G, V, frames) with G <= phi <= V for box-box pairs, both exact when the boxes
         interpenetrate or when G = V. Penetrating: the minimal separating translation lies along
         one of the 15 separating axes, so phi = G, the largest axis gap. Separated: the closest
         points are a vertex against the other box or two edges, so phi <= V, the smallest
         vertex-box distance, with equality unless an edge pair is closer."""
-        frames = self._box_frames(R_WB, C, nodes, pairs)
+        frames = self._box_frames(R_WA, C, nodes, pairs)
         G = _separating_axis_gap(*frames)
         V = G.copy()
         apart = np.flatnonzero(G > 0.0)
@@ -312,9 +314,9 @@ class DistanceOracle:
             V[apart] = _vertex_distance(*(f[apart] for f in frames))
         return G, V, frames
 
-    def box_box_distance(self, R_WB, C, nodes, pairs) -> np.ndarray:
+    def box_box_distance(self, R_WA, C, nodes, pairs) -> np.ndarray:
         """Exact signed distance of box-box pairs (see `box_box_bounds`)."""
-        return box_box_exact(*self.box_box_bounds(R_WB, C, nodes, pairs))
+        return box_box_exact(*self.box_box_bounds(R_WA, C, nodes, pairs))
 
     def native_distances(self, lease: _Lease, Q, nodes, pairs) -> np.ndarray:
         """Drake's narrowphase, one configuration at a time; entries grouped by node."""

@@ -268,7 +268,9 @@ there is one; otherwise `kCertifiedFree`.
 - *Prefilter.* The bounding spheres, posed at $q_c$, give
   $\varphi_p \ge \lVert c_A - c_B \rVert - R_A - R_B$.
   When that lower bound already satisfies (12), the pair is certified with no
-  narrowphase work.
+  narrowphase work. (This package adds a second lower bound for box-box pairs,
+  the largest separating-axis gap, which is tight for the thin boxes bounding
+  spheres serve badly.)
 - *Drop.* A pair certified at a node is certified on every sub-curve of it, so
   it is dropped for the node's whole subtree. This is the dominant work-saver.
 - *Breakpoints.* The loop queries interior midpoints only, so it reaches
@@ -326,6 +328,11 @@ of `drake/geometry/query_object.h`).
 `Mesh` is certified as its convex hull, so it carries `Convex`'s values.
 Pairs with a half space are computed in closed form and carry the default
 $10^{-6}$ m.
+This package also computes sphere-sphere, sphere-box and box-box pairs in
+closed form (exact up to rounding); they keep the $\tau_p$ of the table.
+Drake's own box-box and convex-convex distances can exceed their documented
+accuracy on rare poses; [relation-to-drake.md](relation-to-drake.md) has the
+measurement.
 Every combination not listed below is documented at $6 \times 10^{-15}$ m or
 better and carries the default.
 
