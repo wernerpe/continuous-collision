@@ -1,3 +1,5 @@
+*Co-authored by Peter Werner and Claude (Anthropic).*
+
 # continuous-collision
 
 `continuous-collision` proves that a trajectory of a Drake robot model is
