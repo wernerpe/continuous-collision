@@ -120,6 +120,12 @@ mesh can produce false violations.
 For tight nonconvex obstacles, register a convex decomposition as several
 `Convex` geometries.
 Deformable geometries raise.
+Sphere, box and half-space pairs are measured in closed form here; every other
+pair goes through Drake's signed-distance query. Drake's distance between two
+convex polytopes (`Convex`, `Mesh`) can over-report by up to a millimeter on
+rare poses, far beyond its documented accuracy, which weakens the second
+assumption above for those pairs (in the fork too); see
+[docs/relation-to-drake.md](docs/relation-to-drake.md).
 
 **HalfSpace rules.** A pair of two half spaces raises.
 A half space may be the static partner of a rotating body, such as an anchored
