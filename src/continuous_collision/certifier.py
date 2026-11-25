@@ -20,7 +20,7 @@ import numpy as np
 
 from ._numerics import NUMERICAL_SLACK, is_certified, is_definite_violation
 from .bezier_path import PiecewiseBezierPath, split_at_half
-from .distance_oracle import DistanceOracle, Route
+from .distance_oracle import DistanceOracle, Route, box_box_exact
 from .kinematics import BatchKinematics
 from .motion_bound import MotionBoundTable
 
@@ -99,8 +99,22 @@ class Certifier:
         dist = np.sqrt(dx * dx + dy * dy + dz * dz)
         return dist - o.slot_radius[sa] - o.slot_radius[sb]
 
-    def _distances(self, Q, X, C, lower, nodes, pairs):
-        """phi_hat for each entry, by route; entries are grouped by node."""
+    def _tighten(self, lower, X, C, nodes, pairs, settled):
+        """Raises `lower` to the separating-axis bound on box-box entries `settled` rejects:
+        a second, tighter free-ball lower bound where bounding spheres are poor (thin boxes)."""
+        boxes = np.flatnonzero(~settled(lower) & (self.oracle.route[pairs] == Route.BOXES))
+        if len(boxes) == 0:
+            return lower
+        Xs = np.stack(X, axis=1)
+        lower = lower.copy()
+        gap = self.oracle.box_box_lower_bound(Xs[:, :, :3, :3], C, nodes[boxes], pairs[boxes])
+        lower[boxes] = np.maximum(lower[boxes], gap)
+        return lower
+
+    def _distances(self, Q, X, C, lower, nodes, pairs, tau, bound, at_floor):
+        """phi_hat for each entry, by route; entries are grouped by node. Box-box entries get
+        their exact distance only where the bounds G <= phi <= V could change a decision or a
+        value is recorded; elsewhere phi_hat = V decides identically."""
         o = self.oracle
         phi = np.empty(len(pairs))
         route = o.route[pairs]
@@ -108,13 +122,26 @@ class Certifier:
         phi[spheres] = lower[spheres]  # The bounding spheres are the spheres: exact.
         half = (route == Route.HALFSPACE_A) | (route == Route.HALFSPACE_B)
         box = route == Route.SPHERE_BOX
-        if half.any() or box.any():
+        boxes = route == Route.BOXES
+        if half.any() or box.any() or boxes.any():
             Xs = np.stack(X, axis=1)
             R, p = Xs[:, :, :3, :3], Xs[:, :, :3, 3]
             if half.any():
                 phi[half] = o.halfspace_distance(R, p, nodes[half], pairs[half])
             if box.any():
                 phi[box] = o.sphere_box_distance(R, C, nodes[box], pairs[box])
+            if boxes.any():
+                m = self.margin
+                G, V, frames = o.box_box_bounds(R, C, nodes[boxes], pairs[boxes])
+                t, b, f = tau[boxes], bound[boxes], at_floor[boxes]
+                lo_cert, hi_cert = is_certified(G, t, b, m), is_certified(V, t, b, m)
+                lo_viol, hi_viol = is_definite_violation(G, t, m), is_definite_violation(V, t, m)
+                exact = (lo_cert != hi_cert) | (lo_viol != hi_viol) | hi_viol | (~hi_cert & ~lo_viol & f)
+                values = V.copy()
+                k = np.flatnonzero(exact)
+                if len(k):
+                    values[k] = box_box_exact(G[k], V[k], tuple(x[k] for x in frames))
+                phi[boxes] = values
         native = route == Route.NATIVE
         if native.any():
             phi[native] = o.native_distances(self.lease, Q, nodes[native], pairs[native])
@@ -145,13 +172,20 @@ class Certifier:
             nodes = np.full(P, k)
             lower = np.where(o.has_spheres, self._lower_bounds(C, nodes, all_pairs), -np.inf)
             tau, bound = o.tau, self.table.slack
-            skip = np.where(static, is_certified(lower, tau, bound, m), lower >= m)
+
+            def settled(lb):
+                return np.where(static, is_certified(lb, tau, bound, m), lb >= m)
+
+            skip = settled(self._tighten(lower, X, C, nodes, all_pairs, settled))
             if k > 0:
                 skip |= static
             ask = np.flatnonzero(~skip)
             if len(ask) == 0:
                 continue
-            phi = self._distances(Q, X, C, lower[ask], nodes[ask], ask)
+            # Breakpoints test violations, plus certification for static pairs, whose gray
+            # outcome is recorded at once (as a floor node's is).
+            phi = self._distances(Q, X, C, lower[ask], nodes[ask], ask, tau[ask],
+                                  np.where(static[ask], bound[ask], np.inf), static[ask])
             viol = is_definite_violation(phi, tau[ask], m)
             t = np.full(len(ask), times[k])
             self._record("definite", viol, t, Q, nodes[ask], ask, phi)
@@ -220,12 +254,13 @@ class Certifier:
         X = self.kin.anchor_transforms(mid)
         C = o.centers(X)
         lower = self._lower_bounds(C, nodes, pairs)
-        settled = o.has_spheres[pairs] & is_certified(lower, tau, bound, m)
+        settled = o.has_spheres[pairs] & is_certified(
+            self._tighten(lower, X, C, nodes, pairs, lambda lb: is_certified(lb, tau, bound, m)), tau, bound, m)
         ask = np.flatnonzero(~settled)
         if len(ask) == 0:
             return None
         a_nodes, a_pairs, a_tau, a_bound, a_floor = nodes[ask], pairs[ask], tau[ask], bound[ask], at_floor[ask]
-        phi = self._distances(mid, X, C, lower[ask], a_nodes, a_pairs)
+        phi = self._distances(mid, X, C, lower[ask], a_nodes, a_pairs, a_tau, a_bound, a_floor)
 
         viol = is_definite_violation(phi, a_tau, m)
         cert = ~viol & is_certified(phi, a_tau, a_bound, m)

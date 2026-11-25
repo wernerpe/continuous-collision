@@ -72,6 +72,8 @@ class World:
             return float(o.halfspace_distance(R, pos, nodes, pairs)[0])
         if o.route[p] == Route.SPHERE_BOX:
             return float(o.sphere_box_distance(R, C, nodes, pairs)[0])
+        if o.route[p] == Route.BOXES:
+            return float(o.box_box_distance(R, C, nodes, pairs)[0])
         if o.route[p] == Route.SPHERES:
             d = C[0, o.slot_a[p]] - C[0, o.slot_b[p]]
             return float(np.linalg.norm(d) - o.slot_radius[o.slot_a[p]] - o.slot_radius[o.slot_b[p]])
@@ -417,3 +419,128 @@ def test_halfspace_route_against_mesh_uses_the_same_hull():
         for p in (pm, pc):
             assert abs(world.measure(p) - lowest) < EXACT
             assert abs(world.batched(p) - lowest) < EXACT
+
+
+# ----------------------------------------------------------------------------- box pairs
+
+
+def alternating_projections(X_A, h_A, X_B, h_B, iterations=20000):
+    """Distance between two disjoint boxes by alternating projections, which converges to the
+    true distance for disjoint convex sets: an independent ground truth."""
+    RA, cA, RB, cB = X_A.rotation().matrix(), X_A.translation(), X_B.rotation().matrix(), X_B.translation()
+    x, y = cA.copy(), cB.copy()
+    for _ in range(iterations):
+        y = cB + RB @ np.clip(RB.T @ (x - cB), -h_B, h_B)
+        x = cA + RA @ np.clip(RA.T @ (y - cA), -h_A, h_A)
+    return float(np.linalg.norm(x - y))
+
+
+@pytest.mark.parametrize("size_a,size_b", [((0.3, 0.1, 0.05), (0.02, 1.0, 0.4)), ((0.2, 0.2, 0.2), (0.2, 0.2, 0.2)),
+                                           ((1.0, 0.01, 0.5), (0.05, 0.05, 2.0))])
+def test_box_box_route_is_exact(size_a, size_b):
+    builder = RobotDiagramBuilder(time_step=0.0)
+    add_shape_body(builder.plant(), "A", Box(*size_a), [0, 0, 0])
+    add_shape_body(builder.plant(), "B", Box(*size_b), [1, 0, 0])
+    world = World(builder.Build())
+    p = world.pair("A", "B")
+    assert world.oracle.route[p] == Route.BOXES
+    h_A, h_B = 0.5 * np.array(size_a), 0.5 * np.array(size_b)
+    rng = np.random.default_rng(0)
+    separated = penetrating = 0
+    for i in range(1500):
+        X_A, X_B = random_pose(rng, 0.4), random_pose(rng, 0.4)
+        if i % 3 == 0:  # parallel and near-parallel edges
+            X_A = RigidTransform(RotationMatrix(), rng.uniform(-0.3, 0.3, 3))
+            X_B = RigidTransform(RotationMatrix.MakeZRotation(rng.choice([0.0, np.pi / 2, np.pi / 4, 1e-12])),
+                                 rng.uniform(-0.3, 0.3, 3))
+        world.set_pose("A", X_A)
+        world.set_pose("B", X_B)
+        phi = world.batched(p)
+        drake = world.measure(p)
+        if phi > 1e-9:
+            separated += 1
+            if abs(phi - drake) > 1e-9:  # Drake's narrowphase can over-report; see below.
+                assert abs(phi - alternating_projections(X_A, h_A, X_B, h_B)) < 1e-9
+        else:
+            penetrating += 1
+            assert abs(phi - drake) < 1e-9
+    assert separated > 0 and penetrating > 0
+
+
+def test_drake_box_box_over_report_is_not_inherited():
+    """A recorded pose where Drake 1.51.1's box-box distance over-reports the true distance by
+    7.7e-5 m, far above the 1e-6 m tolerance charged for Box-Box. The exact route reports the
+    true distance (confirmed by alternating projections)."""
+    builder = RobotDiagramBuilder(time_step=0.0)
+    add_shape_body(builder.plant(), "A", Box(1.0, 0.01, 0.5), [0, 0, 0])
+    add_shape_body(builder.plant(), "B", Box(0.05, 0.05, 2.0), [1, 0, 0])
+    world = World(builder.Build())
+    rng = np.random.default_rng(0)
+    for _ in range(2307):
+        X_A, X_B = random_pose(rng, 0.4), random_pose(rng, 0.4)
+    world.set_pose("A", X_A)
+    world.set_pose("B", X_B)
+    p = world.pair("A", "B")
+    truth = alternating_projections(X_A, np.array([0.5, 0.005, 0.25]), X_B, np.array([0.025, 0.025, 1.0]), 200000)
+    assert abs(world.batched(p) - truth) < 1e-12
+    drake = world.measure(p)
+    if abs(drake - truth) < 1e-6:
+        pytest.skip("this Drake build measures the pose correctly")
+    assert drake - truth > 7e-5
+
+
+def test_batched_routes_are_batch_invariant(all_shapes_world):
+    """Every closed-form route returns, for one entry, the same bits whatever else shares its
+    round."""
+    world = all_shapes_world
+    o, kin = world.oracle, world.kin
+    rng = np.random.default_rng(12)
+    Q = []
+    for _ in range(23):
+        for n in ["sphere", "box", "capsule", "cylinder", "ellipsoid", "convex", "mesh"]:
+            world.set_pose(n, random_pose(rng, 0.6))
+        Q.append(world.q())
+    Q = np.array(Q)
+
+    def run(rows):
+        X = kin.anchor_transforms(Q[rows])
+        Xs = np.stack(X, axis=1)
+        R, p, C = Xs[:, :, :3, :3], Xs[:, :, :3, 3], o.centers(X)
+        out = {}
+        for route, fn in ((Route.HALFSPACE_A, lambda n, q: o.halfspace_distance(R, p, n, q)),
+                          (Route.HALFSPACE_B, lambda n, q: o.halfspace_distance(R, p, n, q)),
+                          (Route.SPHERE_BOX, lambda n, q: o.sphere_box_distance(R, C, n, q))):
+            pairs = np.flatnonzero(o.route == route)
+            if len(pairs):
+                nodes = np.repeat(np.arange(len(rows)), len(pairs))
+                out[route] = fn(nodes, np.tile(pairs, len(rows))).reshape(len(rows), -1)
+        return out
+
+    together = run(np.arange(len(Q)))
+    for i in range(len(Q)):
+        alone = run(np.array([i]))
+        for route in together:
+            assert np.array_equal(together[route][i], alone[route][0])
+
+
+def test_box_box_route_is_batch_invariant():
+    builder = RobotDiagramBuilder(time_step=0.0)
+    add_shape_body(builder.plant(), "A", Box(0.3, 0.1, 0.05), [0, 0, 0])
+    add_shape_body(builder.plant(), "B", Box(0.02, 1.0, 0.4), [1, 0, 0])
+    world = World(builder.Build())
+    rng = np.random.default_rng(5)
+    Q = []
+    for _ in range(40):
+        world.set_pose("A", random_pose(rng, 0.3))
+        world.set_pose("B", random_pose(rng, 0.3))
+        Q.append(world.q())
+    Q = np.array(Q)
+    o, kin = world.oracle, world.kin
+
+    def run(rows):
+        X = kin.anchor_transforms(Q[rows])
+        R = np.stack(X, axis=1)[:, :, :3, :3]
+        return o.box_box_distance(R, o.centers(X), np.arange(len(rows)), np.zeros(len(rows), dtype=int))
+
+    together = run(np.arange(len(Q)))
+    assert all(together[i] == run(np.array([i]))[0] for i in range(len(Q)))

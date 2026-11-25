@@ -133,12 +133,13 @@ class BatchKinematics:
         Q = np.asarray(Q, dtype=float)
         N = Q.shape[0]
         t = Q[:, self._rotary_coords]
-        coef = np.stack((np.ones_like(t), np.sin(t), 1.0 - np.cos(t), t), axis=1)  # (N, 4, r)
+        sin, vers = np.sin(t), 1.0 - np.cos(t)
         X = [np.broadcast_to(np.eye(4), (N, 4, 4))]
         r = 0
         for parent, how, ps, data in self._steps:
             if how == "rotary":
-                X_rel = (coef[:, :, r] @ self._rotary_D[r]).reshape(N, 4, 4)
+                D = self._rotary_D[r]
+                X_rel = (D[0] + sin[:, r, None] * D[1] + vers[:, r, None] * D[2] + t[:, r, None] * D[3]).reshape(N, 4, 4)
                 r += 1
             elif how == "prismatic":
                 X_rel = data[0] + Q[:, ps, None, None] * data[1]
@@ -146,8 +147,10 @@ class BatchKinematics:
                 R_FM, p_FM = _joint_map(how, Q, ps)
                 X_FM = np.zeros((N, 4, 4))
                 X_FM[:, :3, :3], X_FM[:, :3, 3], X_FM[:, 3, 3] = R_FM, p_FM, 1.0
-                X_rel = data[0] @ X_FM @ data[1]
-            X.append(X_rel if parent == 0 else X[parent] @ X_rel)
+                N_ = len(X_FM)
+                X_rel = _compose(_compose(np.broadcast_to(data[0], (N_, 4, 4)), X_FM),
+                                 np.broadcast_to(data[1], (N_, 4, 4)))
+            X.append(X_rel if parent == 0 else _compose(X[parent], X_rel))
         return X
 
     def body_poses(self, Q: np.ndarray):
@@ -158,6 +161,16 @@ class BatchKinematics:
         R = R_A[:, a] @ self.R_AB
         p = (R_A[:, a] @ self.p_AB[..., None])[..., 0] + p_A[:, a]
         return R, p
+
+
+def _compose(A, B) -> np.ndarray:
+    """A @ B for stacks of 4x4 homogeneous transforms, written elementwise so each product
+    is computed the same way whatever the stack size (a round's result never depends on how
+    many nodes share it)."""
+    out = A[:, :, 0, None] * B[:, None, 0, :]
+    for k in range(1, 4):
+        out = out + A[:, :, k, None] * B[:, None, k, :]
+    return out
 
 
 def _joint_map(type_name: str, Q: np.ndarray, ps: int):

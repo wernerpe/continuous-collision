@@ -89,3 +89,17 @@ def test_batch_kinematics_matches_drake(seed):
             worst = max(worst, np.abs(R[i, b] - X.rotation().matrix()).max(),
                         np.abs(p[i, b] - X.translation()).max())
     assert worst < 1e-12
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_batch_kinematics_is_batch_invariant(seed):
+    """A round's poses must not depend on how many nodes share the round, bit for bit: that is
+    what makes the verdict and the witness a function of the trajectory alone."""
+    rng = np.random.default_rng(100 + seed)
+    model = random_tree(rng)
+    kin = BatchKinematics(KinematicsEngine(model))
+    Q = rng.uniform(-2.0, 2.0, (37, model.plant().num_positions()))
+    together = kin.anchor_transforms(Q)
+    for i in range(len(Q)):
+        alone = kin.anchor_transforms(Q[i:i + 1])
+        assert all(np.array_equal(np.asarray(a)[i], np.asarray(b)[0]) for a, b in zip(together, alone))

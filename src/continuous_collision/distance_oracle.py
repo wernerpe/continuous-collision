@@ -28,6 +28,7 @@ class Route(enum.IntEnum):
     HALFSPACE_B = 2  # Same, geometry b is the half space.
     SPHERES = 3  # Two spheres: |c_a - c_b| - r_a - r_b, exact on both branches.
     SPHERE_BOX = 4  # A sphere and a box: point-to-box distance minus the radius, both branches.
+    BOXES = 5  # Two boxes: separating-axis depth, or the nearest vertex-box / edge-edge distance.
 
 
 _CLASS_NAME = {ShapeClass.SPHERE: "Sphere", ShapeClass.BOX: "Box", ShapeClass.CAPSULE: "Capsule",
@@ -93,6 +94,8 @@ class DistanceOracle:
                 r = Route.SPHERES
             elif {ca, cb} == {ShapeClass.SPHERE, ShapeClass.BOX}:
                 r = Route.SPHERE_BOX
+            elif ca is ShapeClass.BOX and cb is ShapeClass.BOX:
+                r = Route.BOXES
             if r in (Route.HALFSPACE_A, Route.HALFSPACE_B):
                 partner_class = cb if r is Route.HALFSPACE_A else ca
                 if partner_class is ShapeClass.UNSUPPORTED:
@@ -165,7 +168,7 @@ class DistanceOracle:
         self.slot_extent = np.array(self.slot_extent).reshape(G, 3)
         # Bounding-sphere centers grouped by anchor for `centers`; the world anchor's are fixed.
         self._fixed = np.flatnonzero(self.slot_body == 0)
-        self._groups = [(int(a), g, np.vstack((self.slot_center[g].T, np.ones(len(g)))))
+        self._groups = [(int(a), g, self.slot_center[g].T.copy())
                         for a in np.unique(self.slot_body) if a != 0
                         for g in [np.flatnonzero(self.slot_body == a)]]
         #: Pairs the sphere prefilter may test: neither side is a half space.
@@ -228,7 +231,9 @@ class DistanceOracle:
         C = np.empty((N, len(self.slot_body), 3))
         C[:, self._fixed] = self.slot_center[self._fixed]
         for a, g, local in self._groups:
-            C[:, g] = np.swapaxes((X[a][:, :3, :].reshape(-1, 4) @ local).reshape(N, 3, -1), 1, 2)
+            T = X[a]
+            C[:, g] = (T[:, None, :3, 0] * local[0, :, None] + T[:, None, :3, 1] * local[1, :, None]
+                       + T[:, None, :3, 2] * local[2, :, None] + T[:, None, :3, 3])
         return C
 
     def halfspace_distance(self, R_WB, p_WB, nodes, pairs, want_points=False):
@@ -269,6 +274,38 @@ class DistanceOracle:
         out = np.sqrt(outside[:, 0] ** 2 + outside[:, 1] ** 2 + outside[:, 2] ** 2)
         inside = -np.min(h - local, axis=1)
         return np.where((local > h).any(axis=1), out, inside) - self.slot_extent[s_slot, 0]
+
+    def _box_frames(self, R_WB, C, nodes, pairs):
+        """B's rotation and center in A's frame, and both half sizes, for box-box entries."""
+        sa, sb = self.slot_a[pairs], self.slot_b[pairs]
+        R_A = R_WB[nodes, self.slot_body[sa]] @ self.slot_R[sa]
+        R_B = R_WB[nodes, self.slot_body[sb]] @ self.slot_R[sb]
+        R = np.swapaxes(R_A, 1, 2) @ R_B  # B's axes in A's frame, as columns.
+        t = np.einsum("kji,kj->ki", R_A, C[nodes, sb] - C[nodes, sa])  # Bounding centers = box centers.
+        return R, t, self.slot_extent[sa], self.slot_extent[sb]
+
+    def box_box_lower_bound(self, R_WB, C, nodes, pairs) -> np.ndarray:
+        """The largest gap over the 15 separating axes: a lower bound on the signed distance
+        of two boxes on both branches, and exactly it when they interpenetrate."""
+        return _separating_axis_gap(*self._box_frames(R_WB, C, nodes, pairs))
+
+    def box_box_bounds(self, R_WB, C, nodes, pairs):
+        """(G, V, frames) with G <= phi <= V for box-box pairs, both exact when the boxes
+        interpenetrate or when G = V. Penetrating: the minimal separating translation lies along
+        one of the 15 separating axes, so phi = G, the largest axis gap. Separated: the closest
+        points are a vertex against the other box or two edges, so phi <= V, the smallest
+        vertex-box distance, with equality unless an edge pair is closer."""
+        frames = self._box_frames(R_WB, C, nodes, pairs)
+        G = _separating_axis_gap(*frames)
+        V = G.copy()
+        apart = np.flatnonzero(G > 0.0)
+        if len(apart):
+            V[apart] = _vertex_distance(*(f[apart] for f in frames))
+        return G, V, frames
+
+    def box_box_distance(self, R_WB, C, nodes, pairs) -> np.ndarray:
+        """Exact signed distance of box-box pairs (see `box_box_bounds`)."""
+        return box_box_exact(*self.box_box_bounds(R_WB, C, nodes, pairs))
 
     def native_distances(self, lease: _Lease, Q, nodes, pairs) -> np.ndarray:
         """Drake's narrowphase, one configuration at a time; entries grouped by node."""
@@ -373,3 +410,101 @@ def _support_points(oracle: DistanceOracle, slots, R, c, d) -> np.ndarray:
             raise RuntimeError("DistanceOracle: internal error - no support function for this "
                                "shape class; the capability probe should have refused it.")
     return x
+
+
+_SIGNS = np.array([[sx, sy, sz] for sx in (-1.0, 1.0) for sy in (-1.0, 1.0) for sz in (-1.0, 1.0)])
+
+
+_I1, _I2 = np.array([1, 2, 0]), np.array([2, 0, 1])
+
+
+def _separating_axis_gap(R, t, h_A, h_B) -> np.ndarray:
+    """max over the 15 OBB axes of |u.t| - r_A(u) - r_B(u) for unit u, in A's frame, with B at
+    (R, t). Edge-pair axes e_i x b_j use the closed forms of Gottschalk's OBB test; near-parallel
+    edge pairs are skipped, their directions being covered by the face normals."""
+    abs_R = np.abs(R)
+    face_A = np.abs(t) - h_A - np.einsum("kij,kj->ki", abs_R, h_B)
+    face_B = np.abs(np.einsum("ki,kij->kj", t, R)) - np.einsum("ki,kij->kj", h_A, abs_R) - h_B
+    # Index grids for the 9 edge pairs (i, j): rows i1 = i+1, i2 = i+2 and columns j1, j2.
+    i1, i2 = _I1[:, None], _I2[:, None]
+    j1, j2 = _I1[None, :], _I2[None, :]
+    i, j = np.arange(3)[:, None], np.arange(3)[None, :]
+    R_i1j, R_i2j = R[:, i1, j], R[:, i2, j]
+    dist = np.abs(t[:, i2] * R_i1j - t[:, i1] * R_i2j)
+    r_A = h_A[:, i1] * np.abs(R_i2j) + h_A[:, i2] * np.abs(R_i1j)
+    r_B = h_B[:, j1] * abs_R[:, i, j2] + h_B[:, j2] * abs_R[:, i, j1]
+    norm = np.sqrt(R_i1j * R_i1j + R_i2j * R_i2j)
+    edge = np.where(norm > 1e-9, (dist - r_A - r_B) / np.where(norm > 1e-9, norm, 1.0), -np.inf)
+    return np.maximum(np.maximum(face_A.max(axis=1), face_B.max(axis=1)), edge.reshape(len(t), 9).max(axis=1))
+
+
+def _point_box(P, h) -> np.ndarray:
+    """Distance from points P (K, V, 3) to boxes of half sizes h (K, 3), zero inside."""
+    d = np.maximum(np.abs(P) - h[:, None, :], 0.0)
+    return np.sqrt((d * d).sum(axis=2))
+
+
+def _box_edges(h, R=None, t=None):
+    """The 12 edges of each box as (start (K, 12, 3), direction (K, 12, 3)), optionally mapped by
+    x -> R x + t."""
+    starts, dirs = [], []
+    for i in range(3):
+        j, k = (i + 1) % 3, (i + 2) % 3
+        for sj in (-1.0, 1.0):
+            for sk in (-1.0, 1.0):
+                p = np.zeros((len(h), 3))
+                p[:, i], p[:, j], p[:, k] = -h[:, i], sj * h[:, j], sk * h[:, k]
+                d = np.zeros((len(h), 3))
+                d[:, i] = 2.0 * h[:, i]
+                starts.append(p)
+                dirs.append(d)
+    P, D = np.stack(starts, axis=1), np.stack(dirs, axis=1)
+    if R is not None:
+        P = P @ np.swapaxes(R, 1, 2) + t[:, None, :]
+        D = D @ np.swapaxes(R, 1, 2)
+    return P, D
+
+
+def _segment_distance(p1, d1, p2, d2) -> np.ndarray:
+    """Distance between segments p1 + s d1 and p2 + t d2, s, t in [0, 1] (Ericson, Real-Time
+    Collision Detection, 5.1.9), elementwise over leading axes."""
+    r = p1 - p2
+    a = (d1 * d1).sum(-1)
+    e = (d2 * d2).sum(-1)
+    f = (d2 * r).sum(-1)
+    c = (d1 * r).sum(-1)
+    b = (d1 * d2).sum(-1)
+    denom = a * e - b * b
+    s = np.where(denom > 1e-12 * a * e, np.clip((b * f - c * e) / np.where(denom > 0, denom, 1.0), 0.0, 1.0), 0.0)
+    t = (b * s + f) / e
+    low, high = t < 0.0, t > 1.0
+    s = np.where(low, np.clip(-c / a, 0.0, 1.0), np.where(high, np.clip((b - c) / a, 0.0, 1.0), s))
+    t = np.clip(t, 0.0, 1.0)
+    d = p1 + s[..., None] * d1 - p2 - t[..., None] * d2
+    return np.sqrt((d * d).sum(-1))
+
+
+def box_box_exact(G, V, frames) -> np.ndarray:
+    """phi from the bounds G <= phi <= V of `box_box_bounds`: V, unless an edge pair is closer."""
+    phi = V.copy()
+    edges = np.flatnonzero(V - G > 1e-12)
+    if len(edges):
+        phi[edges] = np.minimum(V[edges], _edge_distance(*(f[edges] for f in frames)))
+    return phi
+
+
+def _vertex_distance(R, t, h_A, h_B) -> np.ndarray:
+    """Smallest distance from a vertex of either box to the other box (A at the origin,
+    axis-aligned; B at (R, t))."""
+    V_B = (_SIGNS[None] * h_B[:, None, :]) @ np.swapaxes(R, 1, 2) + t[:, None, :]
+    t_A = -np.einsum("kji,kj->ki", R, t)  # A's center in B's frame
+    V_A = (_SIGNS[None] * h_A[:, None, :]) @ R + t_A[:, None, :]
+    return np.minimum(_point_box(V_B, h_A).min(axis=1), _point_box(V_A, h_B).min(axis=1))
+
+
+def _edge_distance(R, t, h_A, h_B) -> np.ndarray:
+    """Smallest distance between an edge of A and an edge of B."""
+    P_A, D_A = _box_edges(h_A)
+    P_B, D_B = _box_edges(h_B, R, t)
+    d = _segment_distance(P_A[:, :, None], D_A[:, :, None], P_B[:, None], D_B[:, None])
+    return d.reshape(len(t), -1).min(axis=1)
