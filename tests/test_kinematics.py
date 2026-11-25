@@ -102,4 +102,4 @@ def test_batch_kinematics_is_batch_invariant(seed):
     together = kin.anchor_transforms(Q)
     for i in range(len(Q)):
         alone = kin.anchor_transforms(Q[i:i + 1])
-        assert all(np.array_equal(np.asarray(a)[i], np.asarray(b)[0]) for a, b in zip(together, alone))
+        assert np.array_equal(together[i], alone[0])

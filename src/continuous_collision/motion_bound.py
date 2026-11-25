@@ -171,6 +171,7 @@ class KinematicsEngine:
         self._build_topology()
         self._build_geometry()
         self._check_halfspace_rule()
+        self._tables: dict = {}
 
     # ------------------------------------------------------------------ topology
 
@@ -409,6 +410,21 @@ class KinematicsEngine:
 
         body_a = np.asarray(body_a, dtype=int)
         body_b = np.asarray(body_b, dtype=int)
+        # The table depends on the box only through these; a planner checking many curves of
+        # one robot (all-revolute, nothing carved) reuses one table.
+        key = (box_hop.tobytes(), quat_min_norm.tobytes(), constant.tobytes(),
+               (upper - lower)[constant].tobytes(), body_a.tobytes(), body_b.tobytes())
+        cached = self._tables.get(key)
+        if cached is not None:
+            return cached
+        table = self._assemble(box_hop, quat_min_norm, lower, upper, constant, body_a, body_b)
+        if len(self._tables) >= 16:
+            self._tables.pop(next(iter(self._tables)))
+        self._tables[key] = table
+        return table
+
+    def _assemble(self, box_hop, quat_min_norm, lower, upper, constant, body_a, body_b) -> MotionBoundTable:
+        n = self.num_positions
         P = len(body_a)
         if P and (min(body_a.min(), body_b.min()) < 0 or max(body_a.max(), body_b.max()) >= self.num_bodies):
             raise RuntimeError(

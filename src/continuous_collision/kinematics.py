@@ -127,19 +127,20 @@ class BatchKinematics:
         self._rotary_coords = np.array([ps for ps, _ in rotary], dtype=int)
         self._rotary_D = np.array([d.reshape(4, 16) for _, d in rotary]).reshape(len(rotary), 4, 16)
 
-    def anchor_transforms(self, Q: np.ndarray) -> list:
-        """Homogeneous world poses of every anchor: a list of A arrays of shape (N, 4, 4),
-        anchor 0 being the world. One small GEMM and one batched product per mobile joint."""
+    def anchor_transforms(self, Q: np.ndarray) -> np.ndarray:
+        """Homogeneous world poses of every anchor, shape (N, A, 4, 4), anchor 0 being the
+        world: one batched product per mobile joint."""
         Q = np.asarray(Q, dtype=float)
         N = Q.shape[0]
-        t = Q[:, self._rotary_coords]
-        sin, vers = np.sin(t), 1.0 - np.cos(t)
-        X = [np.broadcast_to(np.eye(4), (N, 4, 4))]
+        t = Q[:, self._rotary_coords, None]
+        D = self._rotary_D
+        rotary = (D[:, 0] + np.sin(t) * D[:, 1] + (1.0 - np.cos(t)) * D[:, 2] + t * D[:, 3]).reshape(N, -1, 4, 4)
+        X = np.empty((N, self.num_anchors, 4, 4))
+        X[:, 0] = np.eye(4)
         r = 0
-        for parent, how, ps, data in self._steps:
+        for a, (parent, how, ps, data) in enumerate(self._steps, start=1):
             if how == "rotary":
-                D = self._rotary_D[r]
-                X_rel = (D[0] + sin[:, r, None] * D[1] + vers[:, r, None] * D[2] + t[:, r, None] * D[3]).reshape(N, 4, 4)
+                X_rel = rotary[:, r]
                 r += 1
             elif how == "prismatic":
                 X_rel = data[0] + Q[:, ps, None, None] * data[1]
@@ -150,12 +151,12 @@ class BatchKinematics:
                 N_ = len(X_FM)
                 X_rel = _compose(_compose(np.broadcast_to(data[0], (N_, 4, 4)), X_FM),
                                  np.broadcast_to(data[1], (N_, 4, 4)))
-            X.append(X_rel if parent == 0 else _compose(X[parent], X_rel))
+            X[:, a] = X_rel if parent == 0 else _compose(X[:, parent], X_rel)
         return X
 
     def body_poses(self, Q: np.ndarray):
         """(R, p) of shapes (N, nb, 3, 3), (N, nb, 3): X_WB for every body (tests, examples)."""
-        X = np.stack(self.anchor_transforms(Q), axis=1)
+        X = self.anchor_transforms(Q)
         R_A, p_A = X[:, :, :3, :3], X[:, :, :3, 3]
         a = self.anchor_of_body
         R = R_A[:, a] @ self.R_AB
@@ -164,13 +165,10 @@ class BatchKinematics:
 
 
 def _compose(A, B) -> np.ndarray:
-    """A @ B for stacks of 4x4 homogeneous transforms, written elementwise so each product
-    is computed the same way whatever the stack size (a round's result never depends on how
-    many nodes share it)."""
-    out = A[:, :, 0, None] * B[:, None, 0, :]
-    for k in range(1, 4):
-        out = out + A[:, :, k, None] * B[:, None, k, :]
-    return out
+    """A @ B for stacks of 4x4 transforms. numpy multiplies a stack slice by slice with one
+    kernel, so a node's product does not depend on how many nodes share its round (pinned by
+    the batch-invariance tests); a 2-D GEMM over the stack would not have that property."""
+    return np.matmul(np.ascontiguousarray(A), np.ascontiguousarray(B))
 
 
 def _joint_map(type_name: str, Q: np.ndarray, ps: int):

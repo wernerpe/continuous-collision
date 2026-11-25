@@ -168,9 +168,18 @@ class DistanceOracle:
         self.slot_extent = np.array(self.slot_extent).reshape(G, 3)
         # Bounding-sphere centers grouped by anchor for `centers`; the world anchor's are fixed.
         self._fixed = np.flatnonzero(self.slot_body == 0)
-        self._groups = [(int(a), g, self.slot_center[g].T.copy())
-                        for a in np.unique(self.slot_body) if a != 0
-                        for g in [np.flatnonzero(self.slot_body == a)]]
+        # The others' centers in homogeneous anchor coordinates, padded to a common width, and
+        # each moving slot's position in the flattened (anchor, column) product.
+        self._moving = np.flatnonzero(self.slot_body != 0)
+        self._anchors = np.unique(self.slot_body[self._moving])
+        width = max([int((self.slot_body == a).sum()) for a in self._anchors], default=0)
+        self._local = np.zeros((len(self._anchors), 4, width))
+        self._column = np.zeros(len(self._moving), dtype=int)
+        for i, a in enumerate(self._anchors):
+            members = np.flatnonzero(self.slot_body[self._moving] == a)
+            self._local[i, :3, :len(members)] = self.slot_center[self._moving[members]].T
+            self._local[i, 3, :len(members)] = 1.0
+            self._column[members] = i * width + np.arange(len(members))
         #: Pairs the sphere prefilter may test: neither side is a half space.
         self.has_spheres = (self.slot_radius[self.slot_a] >= 0) & (self.slot_radius[self.slot_b] >= 0)
 
@@ -224,16 +233,16 @@ class DistanceOracle:
         p = p_WB[nodes, self.slot_body[slots]]
         return R @ self.slot_R[slots], np.einsum("kij,kj->ki", R, self.slot_p[slots]) + p
 
-    def centers(self, X: list) -> np.ndarray:
+    def centers(self, X: np.ndarray) -> np.ndarray:
         """World centers of every slot's bounding sphere, shape (N, G, 3), from the anchors'
-        homogeneous poses (BatchKinematics.anchor_transforms)."""
-        N = X[0].shape[0]
+        homogeneous poses X (BatchKinematics.anchor_transforms). A stacked product, computed
+        slice by slice, so a node's centers do not depend on its round."""
+        N = X.shape[0]
         C = np.empty((N, len(self.slot_body), 3))
         C[:, self._fixed] = self.slot_center[self._fixed]
-        for a, g, local in self._groups:
-            T = X[a]
-            C[:, g] = (T[:, None, :3, 0] * local[0, :, None] + T[:, None, :3, 1] * local[1, :, None]
-                       + T[:, None, :3, 2] * local[2, :, None] + T[:, None, :3, 3])
+        if len(self._anchors):
+            W = np.matmul(np.ascontiguousarray(X[:, self._anchors, :3]), self._local)  # (N, A', 3, w)
+            C[:, self._moving] = np.swapaxes(W, 2, 3).reshape(N, -1, 3)[:, self._column]
         return C
 
     def halfspace_distance(self, R_WB, p_WB, nodes, pairs, want_points=False):

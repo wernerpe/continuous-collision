@@ -56,7 +56,7 @@ def main():
             plant.SetFreeBodyPose(context, plant.GetBodyByName("B"), X_B)
             q = plant.GetPositions(context)
             X = kin.anchor_transforms(q[None])
-            Xs = np.stack(X, axis=1)
+            Xs = X
             exact = float(oracle.box_box_distance(Xs[:, :, :3, :3], oracle.centers(X), np.array([0]), np.array([0]))[0])
             drake = oracle.signed_distance(lease, q, 0)[0]
             error = drake - exact

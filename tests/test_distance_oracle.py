@@ -64,7 +64,7 @@ class World:
     def batched(self, p):
         o = self.oracle
         X = self.kin.anchor_transforms(self.q()[None])
-        Xs = np.stack(X, axis=1)
+        Xs = X
         R, pos = Xs[:, :, :3, :3], Xs[:, :, :3, 3]
         C = o.centers(X)
         nodes, pairs = np.array([0]), np.array([p])
@@ -504,7 +504,7 @@ def test_batched_routes_are_batch_invariant(all_shapes_world):
 
     def run(rows):
         X = kin.anchor_transforms(Q[rows])
-        Xs = np.stack(X, axis=1)
+        Xs = X
         R, p, C = Xs[:, :, :3, :3], Xs[:, :, :3, 3], o.centers(X)
         out = {}
         for route, fn in ((Route.HALFSPACE_A, lambda n, q: o.halfspace_distance(R, p, n, q)),
@@ -539,7 +539,7 @@ def test_box_box_route_is_batch_invariant():
 
     def run(rows):
         X = kin.anchor_transforms(Q[rows])
-        R = np.stack(X, axis=1)[:, :, :3, :3]
+        R = X[:, :, :3, :3]
         return o.box_box_distance(R, o.centers(X), np.arange(len(rows)), np.zeros(len(rows), dtype=int))
 
     together = run(np.arange(len(Q)))

@@ -105,9 +105,8 @@ class Certifier:
         boxes = np.flatnonzero(~settled(lower) & (self.oracle.route[pairs] == Route.BOXES))
         if len(boxes) == 0:
             return lower
-        Xs = np.stack(X, axis=1)
         lower = lower.copy()
-        gap = self.oracle.box_box_lower_bound(Xs[:, :, :3, :3], C, nodes[boxes], pairs[boxes])
+        gap = self.oracle.box_box_lower_bound(X[:, :, :3, :3], C, nodes[boxes], pairs[boxes])
         lower[boxes] = np.maximum(lower[boxes], gap)
         return lower
 
@@ -124,8 +123,7 @@ class Certifier:
         box = route == Route.SPHERE_BOX
         boxes = route == Route.BOXES
         if half.any() or box.any() or boxes.any():
-            Xs = np.stack(X, axis=1)
-            R, p = Xs[:, :, :3, :3], Xs[:, :, :3, 3]
+            R, p = X[:, :, :3, :3], X[:, :, :3, 3]
             if half.any():
                 phi[half] = o.halfspace_distance(R, p, nodes[half], pairs[half])
             if box.any():
@@ -157,40 +155,43 @@ class Certifier:
     # ------------------------------------------------------------------ breakpoints
 
     def _breakpoints(self):
-        """q(t0), every junction, and q(tf): the configurations node midpoints only approach.
-        Static pairs (empty J(p)) are settled once and for all at q(t0)."""
+        """q(t0), every junction, and q(tf): the configurations node midpoints only approach,
+        decided in one batch. Static pairs (empty J(p)) are settled once and for all at q(t0)."""
         segs = self.path.segments
         Q = np.array([s.control_points[:, 0] for s in segs] + [segs[-1].control_points[:, -1]])
         times = np.array([s.t_start for s in segs] + [segs[-1].t_end])
         X = self.kin.anchor_transforms(Q)
         C = self.oracle.centers(X)
         o, m = self.oracle, self.margin
-        P = o.num_pairs
         static = ~self.table.in_J.any(axis=1)
-        all_pairs = np.arange(P)
-        for k in range(len(Q)):
-            nodes = np.full(P, k)
-            lower = np.where(o.has_spheres, self._lower_bounds(C, nodes, all_pairs), -np.inf)
-            tau, bound = o.tau, self.table.slack
+        moving = np.flatnonzero(~static)
+        # Entries in the fork's order: breakpoint by breakpoint, pairs ascending; static pairs
+        # only at q(t0).
+        nodes = np.concatenate([np.zeros(o.num_pairs, dtype=int)] +
+                               [np.full(len(moving), k) for k in range(1, len(Q))])
+        pairs = np.concatenate([np.arange(o.num_pairs)] + [moving] * (len(Q) - 1))
+        is_static = static[pairs]
+        tau, bound = o.tau[pairs], self.table.slack[pairs]
+        lower = np.where(o.has_spheres[pairs], self._lower_bounds(C, nodes, pairs), -np.inf)
 
-            def settled(lb):
-                return np.where(static, is_certified(lb, tau, bound, m), lb >= m)
+        def settled(lb):
+            # A static pair's bound is its carve-out residual; a moving pair cannot be a
+            # violation once the lower bound clears the margin.
+            return np.where(is_static, is_certified(lb, tau, bound, m), lb >= m)
 
-            skip = settled(self._tighten(lower, X, C, nodes, all_pairs, settled))
-            if k > 0:
-                skip |= static
-            ask = np.flatnonzero(~skip)
-            if len(ask) == 0:
-                continue
-            # Breakpoints test violations, plus certification for static pairs, whose gray
-            # outcome is recorded at once (as a floor node's is).
-            phi = self._distances(Q, X, C, lower[ask], nodes[ask], ask, tau[ask],
-                                  np.where(static[ask], bound[ask], np.inf), static[ask])
-            viol = is_definite_violation(phi, tau[ask], m)
-            t = np.full(len(ask), times[k])
-            self._record("definite", viol, t, Q, nodes[ask], ask, phi)
-            gray = ~viol & static[ask] & ~is_certified(phi, tau[ask], bound[ask], m)
-            self._record("inconclusive", gray, t, Q, nodes[ask], ask, phi)
+        ask = np.flatnonzero(~settled(self._tighten(lower, X, C, nodes, pairs, settled)))
+        if len(ask) == 0:
+            return
+        a_nodes, a_pairs, a_static = nodes[ask], pairs[ask], is_static[ask]
+        # Breakpoints test violations, plus certification for static pairs, whose gray outcome
+        # is recorded at once (as a floor node's is).
+        phi = self._distances(Q, X, C, lower[ask], a_nodes, a_pairs, tau[ask],
+                              np.where(a_static, bound[ask], np.inf), a_static)
+        viol = is_definite_violation(phi, tau[ask], m)
+        t = times[a_nodes]
+        self._record("definite", viol, t, Q, a_nodes, a_pairs, phi)
+        gray = ~viol & a_static & ~is_certified(phi, tau[ask], bound[ask], m)
+        self._record("inconclusive", gray, t, Q, a_nodes, a_pairs, phi)
 
     # ------------------------------------------------------------------ subdivision
 
