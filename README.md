@@ -156,8 +156,9 @@ This package runs the same algorithm in Python on top of stock pydrake: Drake's
 own signed-distance queries for general shape pairs, and exact closed forms for
 half-space, sphere-sphere, sphere-box and box-box pairs.
 On the 436 curves of the brick corpus it returns the fork's verdict and witness
-on every curve, at 1.1 times the fork's single-thread wall time (median);
-[docs/benchmarks.md](docs/benchmarks.md) has the numbers.
+on every curve, at 1.2 times the fork's single-thread wall time (median); on
+small checks dominated by Drake's narrowphase it costs about 1.5 ms of fixed
+overhead per check. [docs/benchmarks.md](docs/benchmarks.md) has the numbers.
 If the PR lands, switch by changing one import:
 
 ```python

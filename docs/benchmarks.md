@@ -72,11 +72,11 @@ is the sum over its checkers.
 |---|---|---|---|---|
 | fork, `master-ccd` | 20 (`Parallelism.Max()`) | 18.4 | 25.1 | 28.6 |
 | fork, `master-ccd` | 1 | 31.7 | 66.9 | 159.7 |
-| this package, drake 1.51.1 | `Parallelism.Max()` | 37.9 | 63.0 | 83.5 |
-| this package, drake 1.51.1 | 1 | 37.6 | 60.9 | 86.1 |
+| this package, drake 1.51.1 | `Parallelism.Max()` | 39.2 | 69.0 | 84.4 |
+| this package, drake 1.51.1 | 1 | 39.7 | 69.2 | 86.0 |
 
-Per curve, the package takes 1.12 times the fork's single-thread wall (median;
-p95 2.07). It is relatively slowest on small checks, where its per-round
+Per curve, the package takes 1.22 times the fork's single-thread wall (median;
+p95 2.05). It is relatively slowest on small checks, where its per-round
 overhead dominates, and faster than the single-threaded fork on the largest
 ones, where a round amortizes it over many nodes. The package evaluates
 serially, so its two rows are the same code path.
@@ -110,19 +110,43 @@ scenes and trajectories on the machine above; medians of 20 repetitions after
 
 | scenario | pairs | swept clearance | verdict | nodes, paper | ms, paper (1 thread) | nodes, fork = package | ms, fork 1 thread | ms, fork 20 threads | ms, package |
 |---|---|---|---|---|---|---|---|---|---|
-| shelf, 2 mm tier | 936 | 2.0 mm | `kCertifiedFree` | 262 | 2.983 | 466 | 6.21 | 2.46 | 7.78 |
-| shelf, 1 cm tier | 936 | 10.0 mm | `kCertifiedFree` | 146 | 2.025 | 268 | 4.24 | 2.15 | 5.26 |
-| shelf, 5 cm tier | 936 | 50.0 mm (env) | `kCertifiedFree` | 96 | 1.486 | 88 | 2.08 | 2.39 | 3.79 |
-| PWL edge | 936 | 9.7 mm (env; paper 77 mm) | `kCertifiedFree` | 15 | 0.251 | 127 | 1.62 | 1.55 | 3.26 |
-| dual-arm handover | 3384 | 16.3 mm | `kCertifiedFree` | 110 | 1.506 | 63 | 2.43 | 2.42 | 4.01 |
-| grazing, `distance_resolution` 1e-6 | 936 | 2.4 nm | `kInconclusive` | | | 14,696 | 156.5 | 16.1 | 88.6 |
-| grazing, `distance_resolution` 1e-8 | 936 | 2.4 nm | `kInconclusive` | 5,785,680 (`min_interval`) | 42,037 | 827,614 | 8,354 | 793 | 4,689 |
+| shelf, 2 mm tier | 936 | 2.0 mm | `kCertifiedFree` | 262 | 2.983 | 466 | 6.21 | 2.46 | 7.33 |
+| shelf, 1 cm tier | 936 | 10.0 mm | `kCertifiedFree` | 146 | 2.025 | 268 | 4.24 | 2.15 | 5.31 |
+| shelf, 5 cm tier | 936 | 50.0 mm (env) | `kCertifiedFree` | 96 | 1.486 | 88 | 2.08 | 2.39 | 3.95 |
+| PWL edge | 936 | 9.7 mm (env; paper 77 mm) | `kCertifiedFree` | 15 | 0.251 | 127 | 1.62 | 1.55 | 2.98 |
+| dual-arm handover | 3384 | 16.3 mm | `kCertifiedFree` | 110 | 1.506 | 63 | 2.43 | 2.42 | 4.21 |
+| grazing, `distance_resolution` 1e-6 | 936 | 2.4 nm | `kInconclusive` | | | 14,696 | 156.5 | 16.1 | 89.9 |
+| grazing, `distance_resolution` 1e-8 | 936 | 2.4 nm | `kInconclusive` | 5,785,680 (`min_interval`) | 42,037 | 827,614 | 8,354 | 793 | 4,801 |
 
 "env" marks clearance to the shelf only; the iiwa14 sphere model carries an
 intrinsic 25.2 mm self-clearance. The scenes differ from the paper's, so only
 the fork and package columns compare like with like: identical verdicts and
 node counts on every row, and identical witnesses on the grazing rows. On this
 machine the fork's 1 cm tier costs 4.24 ms on one thread; the paper reports
-2.0 ms on a faster machine for a shallower tree. The package is 1.2 to 2 times
-slower than the single-threaded fork on these sub-10 ms checks, and about half
-its time on the grazing rows, where rounds hold thousands of nodes.
+2.0 ms on a faster machine for a shallower tree. The package is 1.2 to 1.9
+times slower than the single-threaded fork on these sub-10 ms checks, and takes
+about 57 % of its time on the grazing rows, where rounds hold thousands of
+nodes.
+
+## 3. The soundness-fuzz worlds
+
+The brick corpus has spheres and boxes only, which this package measures in
+closed form. `benchmarks/fuzz_referee.py` replays the 200 random worlds and
+trajectories of the soundness fuzz (`tests/fuzz_worlds.py`: revolute and
+prismatic chains and trees, capsules, cylinders, ellipsoids, convex
+tetrahedra, boxes, spheres, half-space floors; piecewise-linear, Bézier and
+B-spline trajectories; grazing margins on every fifth case) on both, one run
+each, one thread, same machine:
+
+| | count |
+|---|---|
+| verdicts agree | 200 / 200 (120 certified, 50 violations, 30 inconclusive) |
+| certified with the same `num_nodes` | 120 / 120 |
+| refused with the same witness pair and time | 80 / 80 (configurations bit-identical, distances within 2e-16 m) |
+| wall, fork / package, median | 0.13 ms / 1.8 ms |
+| wall, fork / package, p95 | 8.1 ms / 23 ms |
+
+These worlds send most pairs through Drake's narrowphase one configuration at
+a time, and their checks are tiny (11 nodes median), so the package's fixed
+cost of roughly 1.5 ms per check dominates: about 15 times the fork's wall at
+the median, 2 to 3 times on the largest trees.

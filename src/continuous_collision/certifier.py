@@ -28,6 +28,9 @@ from .motion_bound import MotionBoundTable
 #: Largest number of nodes decided in one round.
 CHUNK = 2048
 
+_NATIVE, _HALF_A, _HALF_B, _SPHERES, _SPHERE_BOX, _BOXES = (int(r) for r in (
+    Route.NATIVE, Route.HALFSPACE_A, Route.HALFSPACE_B, Route.SPHERES, Route.SPHERE_BOX, Route.BOXES))
+
 
 @dataclass
 class Witness:
@@ -75,6 +78,8 @@ class Certifier:
         self.margin, self.resolution, self.lease = margin, resolution, lease
         self.sink = _Sink()
         self.num_nodes = 0
+        present = set(np.unique(oracle.route).tolist())
+        self._routes = {r: r in present for r in (_NATIVE, _HALF_A, _HALF_B, _SPHERES, _SPHERE_BOX, _BOXES)}
 
     def run(self):
         """Returns (verdict name, Witness or None, num_nodes)."""
@@ -105,7 +110,9 @@ class Certifier:
     def _tighten(self, lower, X, C, nodes, pairs, settled):
         """Raises `lower` to the separating-axis bound on box-box entries `settled` rejects:
         a second, tighter free-ball lower bound where bounding spheres are poor (thin boxes)."""
-        boxes = np.flatnonzero(~settled(lower) & (self.oracle.route[pairs] == Route.BOXES))
+        if not self._routes[_BOXES]:
+            return lower
+        boxes = np.flatnonzero(~settled(lower) & (self.oracle.route[pairs] == _BOXES))
         if len(boxes) == 0:
             return lower
         lower = lower.copy()
@@ -117,34 +124,41 @@ class Certifier:
         """phi_hat for each entry, by route; entries are grouped by node. Box-box entries get
         their exact distance only where the bounds G <= phi <= V could change a decision or a
         value is recorded; elsewhere phi_hat = V decides identically."""
-        o = self.oracle
+        o, present = self.oracle, self._routes
         phi = np.empty(len(pairs))
         route = o.route[pairs]
-        spheres = route == Route.SPHERES
-        phi[spheres] = lower[spheres]  # The bounding spheres are the spheres: exact.
-        half = (route == Route.HALFSPACE_A) | (route == Route.HALFSPACE_B)
-        box = route == Route.SPHERE_BOX
-        boxes = route == Route.BOXES
-        if half.any() or box.any() or boxes.any():
-            R, p = X[:, :, :3, :3], X[:, :, :3, 3]
-            if half.any():
-                phi[half] = o.halfspace_distance(R, p, nodes[half], pairs[half])
-            if box.any():
-                phi[box] = o.sphere_box_distance(R, C, nodes[box], pairs[box])
-            if boxes.any():
-                m = self.margin
-                G, V, frames = o.box_box_bounds(R, C, nodes[boxes], pairs[boxes])
-                t, b, f = tau[boxes], bound[boxes], at_floor[boxes]
-                lo_cert, hi_cert = is_certified(G, t, b, m), is_certified(V, t, b, m)
-                lo_viol, hi_viol = is_definite_violation(G, t, m), is_definite_violation(V, t, m)
-                exact = (lo_cert != hi_cert) | (lo_viol != hi_viol) | hi_viol | (~hi_cert & ~lo_viol & f)
-                values = V.copy()
-                k = np.flatnonzero(exact)
-                if len(k):
-                    values[k] = box_box_exact(G[k], V[k], tuple(x[k] for x in frames))
-                phi[boxes] = values
-        native = route == Route.NATIVE
-        if native.any():
+        R, p = X[:, :, :3, :3], X[:, :, :3, 3]
+
+        def select(*kinds):
+            if not any(present[k] for k in kinds):
+                return None
+            mask = route == kinds[0] if len(kinds) == 1 else (route == kinds[0]) | (route == kinds[1])
+            return mask if mask.any() else None
+
+        spheres = select(_SPHERES)
+        if spheres is not None:
+            phi[spheres] = lower[spheres]  # The bounding spheres are the spheres: exact.
+        half = select(_HALF_A, _HALF_B)
+        if half is not None:
+            phi[half] = o.halfspace_distance(R, p, nodes[half], pairs[half])
+        box = select(_SPHERE_BOX)
+        if box is not None:
+            phi[box] = o.sphere_box_distance(R, C, nodes[box], pairs[box])
+        boxes = select(_BOXES)
+        if boxes is not None:
+            m = self.margin
+            G, V, frames = o.box_box_bounds(R, C, nodes[boxes], pairs[boxes])
+            t, b, f = tau[boxes], bound[boxes], at_floor[boxes]
+            lo_cert, hi_cert = is_certified(G, t, b, m), is_certified(V, t, b, m)
+            lo_viol, hi_viol = is_definite_violation(G, t, m), is_definite_violation(V, t, m)
+            exact = (lo_cert != hi_cert) | (lo_viol != hi_viol) | hi_viol | (~hi_cert & ~lo_viol & f)
+            values = V.copy()
+            k = np.flatnonzero(exact)
+            if len(k):
+                values[k] = box_box_exact(G[k], V[k], tuple(x[k] for x in frames))
+            phi[boxes] = values
+        native = select(_NATIVE)
+        if native is not None:
             phi[native] = o.native_distances(self.lease, Q, nodes[native], pairs[native])
         return phi
 
@@ -229,10 +243,11 @@ class Certifier:
     def _round(self, ch: _Chunk):
         # Branch and bound on time: a node starting at or after the earliest violation found so
         # far cannot hold an earlier one.
-        keep = ~(self._t0[ch.seg] + ch.s_lo * self._dt[ch.seg] >= self.sink.best_time)
-        if not keep.any():
+        keep = ~(self._t0[ch.seg] + ch.s_lo * self._dt[ch.seg] >= self.sink.best_time) \
+            if self.sink.definite is not None else None
+        if keep is not None and not keep.any():
             return None
-        if not keep.all():
+        if keep is not None and not keep.all():
             new_index = np.cumsum(keep) - 1
             e = keep[ch.node]
             ch = _Chunk(ch.seg[keep], ch.s_lo[keep], ch.s_hi[keep], ch.cps[keep],

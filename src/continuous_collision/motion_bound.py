@@ -137,17 +137,16 @@ class MotionBoundTable:
         return [(int(j), float(self.lam[p, j])) for j in np.flatnonzero(self.in_J[p])]
 
     def __post_init__(self):
-        self._lam_T = np.ascontiguousarray(self.lam.T)
         self._used = np.flatnonzero(self.in_J.any(axis=0))
+        self._lam_used = np.ascontiguousarray(self.lam[:, self._used])
 
     def travel_bound(self, pairs: np.ndarray, w: np.ndarray, nodes: np.ndarray) -> np.ndarray:
         """sum_j lambda(j, p) w_j for entry k = (nodes[k], pairs[k]), w of shape (N, n);
-        accumulated in coordinate order, as the fork's sparse dot product is."""
-        travel = np.zeros(len(pairs))
-        w_T = np.ascontiguousarray(w.T)
-        for j in self._used:
-            travel += self._lam_T[j][pairs] * w_T[j][nodes]
-        return travel
+        accumulated in coordinate order, as the fork's sparse dot product is (a cumulative sum
+        is strictly sequential)."""
+        if len(self._used) == 0:
+            return np.zeros(len(pairs))
+        return np.cumsum(self._lam_used[pairs] * w[:, self._used][nodes], axis=1)[:, -1]
 
     def motion_bound(self, p: int, w: np.ndarray) -> float:
         """Delta_p = sigma_p + sum_j lambda(j, p) w_j for one pair."""
